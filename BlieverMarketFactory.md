@@ -15,7 +15,7 @@ The Bliever prediction-market stack is composed of four discrete components. Eac
 │  BlieverV1Pool      Global USDC vault (LS-LMSR liability hub)    │
 │  BlieverMarket      LS-LMSR AMM per prediction event (clone)     │
 │  BlieverUmaAdapter  UMA oracle resolution bridge (UUPS proxy)    │
-│  BlieverMarketFactory  ← you are here                           │
+│  BlieverMarketFactory  ← you are here                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -73,16 +73,17 @@ Individual market clones are **immutable by design**. Traders require a cryptogr
 The factory deploys every clone using the `CREATE2` opcode instead of the standard `CREATE`. The key property: **the clone's address is computable before the transaction is broadcast**.
 
 ```
+salt           = keccak256(abi.encode(questionId))
 market_address = keccak256(0xff ++ factory_address ++ salt ++ keccak256(proxy_bytecode))[12:]
 ```
 
-**Why this matters:**
+The salt is derived **on-chain inside `deployMarket`** from `params.questionId`. Callers do not supply a salt. This means:
 
-- **Lazy deployment / pre-routing**: Off-chain order-matching engines and frontends can route limit orders and display market data at the pre-computed address *before* the deployment transaction lands on-chain. The clone is only initialized when the first trade requires an active pool registration.
+- **Cryptographically enforced bijection**: Each unique oracle question maps to exactly one deterministic market address. No operator can accidentally deploy two markets for the same question, and no duplicate or mismatched salt is possible.
+- **Simplified off-chain integration**: Frontends and indexers call `predictMarketAddress(questionId)` directly — no separate salt computation step is required.
+- **Lazy deployment / pre-routing**: Off-chain order-matching engines can route limit orders and display market data at the pre-computed address *before* the deployment transaction lands on-chain.
 - **Predictable integration**: Indexers and analytics dashboards can subscribe to market events at addresses known before block confirmation.
-- **Duplicate prevention**: A duplicate salt (which would produce the same address) causes a `CREATE2` collision revert. The factory pre-checks for this before spending gas on token transfers or clone initialization.
-
-The recommended salt derivation is `keccak256(abi.encode(questionId))` — this guarantees uniqueness for any unique oracle question.
+- **Duplicate prevention**: A repeated `questionId` produces the same salt and therefore the same CREATE2 address. The factory pre-checks for this before spending any gas on token transfers or clone initialization, reverting with `QuestionAlreadyDeployed(questionId, existing)`.
 
 ---
 
@@ -124,6 +125,10 @@ Where:
 
 Allowing the operator to pass an arbitrary ε would break the LS-LMSR solvency invariant if the value is wrong. By computing it deterministically from the pool's own parameters, the factory guarantees that `C(q⁰) = R` holds at every market launch — no operator error can produce an under-collateralized market.
 
+`pool.alpha()` and `pool.maxRiskPerMarket()` are read **once** at the start of `deployMarket` and cached in local variables. The internal pure helper `_computeEpsilon` receives the cached values to produce ε. The same `alpha_` value is forwarded directly to `market.initialize()` — guaranteeing that the seed and the clone's stored alpha are always derived from the same read, with no possibility of drift between the two uses.
+
+The public `computeEpsilon(uint8 nOutcomes)` view delegates to the same `_computeEpsilon` helper, reading pool parameters fresh on each external call so operators can verify the value off-chain before constructing a `DeployParams`.
+
 ### The lookup table approach
 
 Because the maximum outcome count is 7 (UMIP-183), `ln(n)` only needs to be correct for integers 2 through 7. A precomputed lookup table provides exact 18-decimal precision at negligible gas cost (~6 conditional branches) — no Solidity math library is required.
@@ -138,12 +143,15 @@ Every `deployMarket()` call executes these steps in one transaction:
 Operator calls deployMarket(params)
     │
     ├─ [1] Validate inputs            ← reverts with descriptive errors if invalid
+    │       (incl. ancillaryData non-empty guard and questionId duplicate check)
     │
-    ├─ [2] Compute ε                  ← reads pool.alpha + pool.maxRiskPerMarket
+    ├─ [2] Read pool.alpha + pool.maxRiskPerMarket once; compute ε
+    │       (cached alpha_ forwarded to both _computeEpsilon and market.initialize)
     │
     ├─ [3] Pull reward tokens         ← safeTransferFrom(caller → factory)
     │
-    ├─ [4] Deploy EIP-1167 clone      ← CREATE2, deterministic address
+    ├─ [4] Derive salt = keccak256(abi.encode(questionId));
+    │       deploy EIP-1167 clone via CREATE2
     │
     ├─ [5] market.initialize(...)     ← q-vector seeded, config pinned
     │
@@ -241,9 +249,11 @@ This design enforces a clean separation: **upgradeable infrastructure** (pool, a
 | Property | Mechanism |
 |---|---|
 | No orphaned clones | Token pull precedes clone deploy; any revert rolls back everything atomically |
-| No invalid seeds | ε computed on-chain from pool params; caller cannot supply arbitrary ε |
+| No invalid seeds | ε computed on-chain from cached pool params; caller cannot supply arbitrary ε |
+| No alpha drift | `pool.alpha()` read once and forwarded to both `_computeEpsilon` and `market.initialize()` |
 | No wrong oracle question | Adapter validates keccak256(fullAncillaryData) == questionId on-chain |
-| No salt reuse | Factory pre-checks CREATE2 address for existing bytecode before spending gas |
+| No duplicate markets | Salt auto-derived from questionId; factory pre-checks CREATE2 address before spending gas |
+| No empty oracle payload | `ancillaryData.length == 0` reverts before any state mutation or token movement |
 | No unauthorized lifecycle control | `isDeployedMarket` mapping prevents acting on non-factory markets |
 | No market upgrade vector | Clones are non-upgradeable; master is pinned as an immutable |
 | No reentrancy | `nonReentrant` modifier on `deployMarket` and `expireUnresolved` |

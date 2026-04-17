@@ -114,7 +114,7 @@ The struct is passed as `calldata` to `deployMarket`. On Base chain, calldata by
 Field              Type       Bytes  Notes
 ─────────────────────────────────────────────────────────
 questionId         bytes32    32     keccak256(fullAncillaryData)
-ancillaryData      bytes      dyn    raw JSON (≤ 8 086 bytes)
+ancillaryData      bytes      dyn    raw JSON (≤ 8 086 bytes; must be non-empty)
 nOutcomes          uint8      1      [2, 7]
 tradingDeadline    uint40     5      Unix timestamp
 resolutionDeadline uint40     5      Unix timestamp > tradingDeadline
@@ -122,8 +122,9 @@ rewardToken        address    20     OO reward token (zero if reward==0)
 reward             uint256    32     OO proposer reward
 bond               uint256    32     OO proposer/disputer bond
 liveness           uint256    32     OO liveness window (seconds)
-salt               bytes32    32     CREATE2 salt
 ```
+
+The CREATE2 salt is not a caller input. It is derived inside `deployMarket` as `keccak256(abi.encode(questionId))`, enforcing a strict 1-to-1 bijection between oracle questions and market addresses. This removes 32 bytes of caller-supplied calldata and eliminates the entire class of salt-mismatch or duplicate-salt operator errors.
 
 `ancillaryData` is a dynamic `bytes` field. When encoding off-chain (ethers.js, viem), it appears as a pointer + length in the head section of the ABI encoding.
 
@@ -133,25 +134,32 @@ salt               bytes32    32     CREATE2 salt
 
 ### Pre-flight checks (gas before state)
 
-All eight validation conditions are checked before any token transfer or state mutation. The recommended pattern: **revert as early as possible with the cheapest check first**.
+All validation conditions are checked before any token transfer or state mutation. The recommended pattern: **revert as early as possible with the cheapest check first**.
 
 ```
 questionId == bytes32(0)                  → InvalidQuestionId
+ancillaryData.length == 0                → InvalidAncillaryData
 nOutcomes out of [MIN, MAX]              → InvalidOutcomeCount
 deadline logic fails                     → InvalidDeadlines
 reward > 0 && rewardToken == address(0) → RewardTokenRequired
-predicted.code.length > 0              → SaltAlreadyUsed
+predicted.code.length > 0              → QuestionAlreadyDeployed
 ```
 
-The salt-collision check (`Clones.predictDeterministicAddress`) costs approximately 500 gas (one EXTCODESIZE opcode). It is positioned last among the pure-validation checks because it makes an external call — cheaper than deploying a clone only to get a CREATE2 collision deep inside Clones.cloneDeterministic.
+`ancillaryData.length == 0` is checked immediately after `questionId` — it is a cheap `CALLDATASIZE`-relative read that fails before any storage access or external call, saving 10–20k gas on malformed inputs.
 
-### Epsilon computation
+The deadline check no longer tests `== 0` explicitly. `block.timestamp >= tradingDeadline` subsumes `tradingDeadline == 0` (block.timestamp is always `> 0` post-merge), and `tradingDeadline >= resolutionDeadline` subsumes `resolutionDeadline == 0`.
+
+The duplicate-market guard (`Clones.predictDeterministicAddress` + `EXTCODESIZE`) costs approximately 500 gas. It is positioned last among the pure-validation checks because it makes an external call — cheaper than deploying a clone only to hit a CREATE2 collision deep inside `Clones.cloneDeterministic`. The error `QuestionAlreadyDeployed(questionId, existing)` is emitted with the oracle question identifier directly, making it immediately actionable for SDK callers.
+
+### Pool parameter read and epsilon computation
 
 ```solidity
-uint256 epsilon = computeEpsilon(params.nOutcomes);
+uint256 alpha_  = pool.alpha();
+uint256 maxRisk = pool.maxRiskPerMarket();
+uint256 epsilon = _computeEpsilon(params.nOutcomes, alpha_, maxRisk);
 ```
 
-Reads `pool.alpha()` and `pool.maxRiskPerMarket()` (two warm SLOADs on the pool proxy — ~200 gas each). Performs integer arithmetic only (no external math library). If the pool returns `alpha = 0` or `maxRiskPerMarket = 0` due to misconfiguration, epsilon may be 0 — caught by the `ZeroEpsilon` guard immediately after.
+`pool.alpha()` and `pool.maxRiskPerMarket()` are each read **once**, at the top of `deployMarket`, before any token or clone operations. The cached `alpha_` is forwarded both to `_computeEpsilon` and directly to `market.initialize()` in step 5 — guaranteeing the clone receives the identical alpha value that ε was computed for, with no possibility of drift between the two uses. The public `computeEpsilon(uint8)` view reads pool parameters fresh on every external call and delegates to the same `_computeEpsilon` pure helper.
 
 ### Token pull
 
@@ -164,12 +172,13 @@ Happens **before** clone deployment. If the caller's allowance is insufficient o
 ### Clone deployment
 
 ```solidity
-market = Clones.cloneDeterministic(implementation, params.salt);
+bytes32 salt = keccak256(abi.encode(params.questionId));
+market = Clones.cloneDeterministic(implementation, salt);
 ```
 
-Deploys the 45-byte EIP-1167 proxy. The OZ `Clones` library uses inline assembly with the `CREATE2` opcode. The proxy bytecode contains the `implementation` address hard-coded at bytes 10–29.
+The salt is derived inside `deployMarket` — not supplied by the caller. This enforces a strict bijection: each `questionId` maps to exactly one deterministic address. The OZ `Clones` library uses inline assembly with the `CREATE2` opcode. The proxy bytecode contains the `implementation` address hard-coded at bytes 10–29.
 
-After this line, `market` contains the new clone's address. The address equals the value returned by `predictMarketAddress(params.salt)`.
+After this line, `market` contains the new clone's address. The address equals the value returned by `predictMarketAddress(params.questionId)`.
 
 ### Clone initialization
 
@@ -178,7 +187,7 @@ IDeployableMarket(market).initialize(
     address(pool),
     params.questionId,
     params.nOutcomes,
-    pool.alpha(),             // ← second pool.alpha() call; snapshot for immutability
+    alpha_,                   // cached above — identical to epsilon's alpha
     params.tradingDeadline,
     params.resolutionDeadline,
     epsilon,
@@ -187,7 +196,7 @@ IDeployableMarket(market).initialize(
 );
 ```
 
-`pool.alpha()` is called a second time here (separately from `computeEpsilon`) to guarantee the clone receives the identical alpha value that ε was computed for. If `pool.alpha()` were to change between the two calls (governance transaction in the same block) there would be a mismatch. In practice this is not possible on Base (single-threaded block execution), but using a cached local variable would be slightly more explicit. The current design prioritizes readability over micro-optimization here.
+`alpha_` is the value cached at the top of `deployMarket` — the same one passed into `_computeEpsilon`. No second `pool.alpha()` call is made here.
 
 `initialize()` internally calls:
 - `LSMath.liquidityParameter(initQ, _alpha)` — validates ε produces a non-degenerate market.
@@ -251,14 +260,30 @@ State updates are placed last (post-interactions). This is intentional and safe 
 
 ---
 
-## 7. `computeEpsilon()` — Math Implementation
+## 7. `computeEpsilon()` and `_computeEpsilon()` — Math Implementation
+
+The public `computeEpsilon(uint8 nOutcomes)` view validates the outcome count and delegates to the pure internal helper `_computeEpsilon(uint8, uint256, uint256)`:
 
 ```solidity
-uint256 R18         = maxRisk * SHARE_TO_USDC;
-uint256 lnN         = _lnLookup(nOutcomes);
-uint256 denominator = MATH_SCALE + (alpha_ * nOutcomes * lnN) / MATH_SCALE;
-uint256 epsilon     = (R18 * MATH_SCALE) / denominator;
+// Public view — reads pool parameters fresh:
+function computeEpsilon(uint8 nOutcomes) public view returns (uint256 epsilon) {
+    if (nOutcomes < MIN_OUTCOMES || nOutcomes > MAX_OUTCOMES)
+        revert BlieverMarketFactory__InvalidOutcomeCount(nOutcomes);
+    epsilon = _computeEpsilon(nOutcomes, pool.alpha(), pool.maxRiskPerMarket());
+}
+
+// Pure internal helper — accepts pre-read parameters:
+function _computeEpsilon(uint8 nOutcomes, uint256 alpha_, uint256 maxRisk)
+    internal pure returns (uint256 epsilon)
+{
+    uint256 R18         = maxRisk * SHARE_TO_USDC;
+    uint256 lnN         = _lnLookup(nOutcomes);
+    uint256 denominator = MATH_SCALE + (alpha_ * nOutcomes * lnN) / MATH_SCALE;
+    epsilon             = (R18 * MATH_SCALE) / denominator;
+}
 ```
+
+Inside `deployMarket`, `pool.alpha()` and `pool.maxRiskPerMarket()` are read once and cached. `_computeEpsilon` is called with those cached values, and `alpha_` is passed directly to `market.initialize()` in step 5. This guarantees the clone's stored alpha and its initial cost function seed are derived from the same read — no second `pool.alpha()` call occurs anywhere in the deployment path.
 
 ### Step-by-step with example values
 
@@ -327,8 +352,8 @@ Inside `BlieverV1Pool.settleMarket(0)`:
 | `deregisterMarket` | `onlyRole(DEFAULT_ADMIN_ROLE)`, `_assertDeployedMarket` | Pool enforces hasTrades check |
 | `pause` (factory) | `onlyRole(PAUSER_ROLE)` | Blocks deployMarket only |
 | `unpause` (factory) | `onlyRole(PAUSER_ROLE)` | Resumes deployMarket |
-| `predictMarketAddress` | — | Pure view, no state |
-| `computeEpsilon` | — | `pool.alpha()` + `pool.maxRiskPerMarket()` reads |
+| `predictMarketAddress` | — | Pure view; derives salt internally from questionId |
+| `computeEpsilon` | — | Validates nOutcomes; delegates to `_computeEpsilon` |
 
 ---
 
@@ -363,10 +388,11 @@ Without either grant, `deployMarket` reverts with an `AccessControl` error at th
 | Error | Cause | Fix |
 |---|---|---|
 | `InvalidQuestionId` | `params.questionId == bytes32(0)` | Pre-compute questionId off-chain correctly |
+| `InvalidAncillaryData` | `params.ancillaryData.length == 0` | Supply non-empty raw ancillary data bytes |
 | `InvalidOutcomeCount(n)` | `n < 2` or `n > 7` | Use nOutcomes ∈ [2, 7]; n > 7 is an adapter cap |
 | `InvalidDeadlines` | tradingDeadline ≥ resolutionDeadline OR tradingDeadline in past | Check deadline ordering; ensure tradingDeadline > block.timestamp |
 | `RewardTokenRequired` | `reward > 0 && rewardToken == address(0)` | Provide a valid rewardToken address |
-| `SaltAlreadyUsed(salt, existing)` | CREATE2 collision; same salt used before | Derive salt from questionId: `keccak256(abi.encode(questionId))` |
+| `QuestionAlreadyDeployed(questionId, existing)` | A market for this questionId was already deployed | Each questionId maps to exactly one market; check `predictMarketAddress(questionId)` |
 | `ZeroEpsilon` | Pool misconfiguration (alpha=0 or maxRisk=0) | Check pool state; contact pool admin |
 | `NotDeployedMarket(market)` | `isDeployedMarket[market] == false` | Only markets deployed by this factory can be managed |
 | `MarketAlreadyResolved(market)` | `expireUnresolved` called on a resolved market | Check `market.resolved()` first |
@@ -385,8 +411,8 @@ Without either grant, `deployMarket` reverts with an `AccessControl` error at th
 
 | Step | Approx. gas | Dominant cost |
 |---|---|---|
-| Pre-flight checks | ~5 000 | EXTCODESIZE for salt collision check |
-| `computeEpsilon` | ~3 000 | 2× warm SLOADs on pool, integer math |
+| Pre-flight checks | ~5 500 | EXTCODESIZE for duplicate-market guard; CALLDATASIZE for ancillaryData guard |
+| Pool read + `_computeEpsilon` | ~3 000 | 2× warm SLOADs on pool (`alpha`, `maxRiskPerMarket`); integer arithmetic only |
 | Token pull (`safeTransferFrom`) | ~30 000 | ERC-20 transfer + allowance check |
 | `cloneDeterministic` | ~41 000 | CREATE2 opcode, 45-byte bytecode init |
 | `market.initialize()` | ~120 000 | n SSTORE slots (q-vector) + Pausable init |
@@ -395,8 +421,11 @@ Without either grant, `deployMarket` reverts with an `AccessControl` error at th
 | Factory state update + event | ~3 000 | 1 SSTORE + 1 LOG |
 | **Total** | **~512 000** | Adapter step is the bottleneck |
 
+`pool.alpha()` and `pool.maxRiskPerMarket()` are each read once at the top of `deployMarket`. The cached `alpha_` is forwarded both to `_computeEpsilon` and `market.initialize()` — a single read covers both uses.
+
 L1 data-availability fee (Base rollup) depends on calldata byte count. For typical ancillaryData (~500 bytes):
 - Non-zero calldata bytes ≈ 400 × 16 gas/byte ≈ 6 400 L2-equiv gas at the L1 calldata cost.
+- `DeployParams` contains no caller-supplied salt field — the 32-byte slot is absent from every deployment call.
 - Using `DeployParams` as a calldata struct avoids redundant ABI encoding overhead from individual arguments.
 
 ---
@@ -416,16 +445,12 @@ const fullData   = utils.concat([rawAncillaryData, suffix]);
 const questionId = utils.keccak256(fullData);
 ```
 
-### Computing the CREATE2 salt
-
-```typescript
-const salt = utils.keccak256(utils.defaultAbiCoder.encode(["bytes32"], [questionId]));
-```
-
 ### Pre-computing market address
 
+The factory derives the salt as `keccak256(abi.encode(questionId))` internally. Frontends and indexers only need to call `predictMarketAddress(questionId)` directly:
+
 ```typescript
-const market = await factory.predictMarketAddress(salt);
+const market = await factory.predictMarketAddress(questionId);
 // market address is deterministic — usable before deployment tx lands
 ```
 
@@ -440,7 +465,7 @@ const epsilon = await factory.computeEpsilon(nOutcomes);
 
 ```typescript
 await rewardToken.approve(factory.address, params.reward);
-// THEN call deployMarket
+// THEN call deployMarket — note: no `salt` field in DeployParams
 const tx = await factory.deployMarket(params);
 const receipt = await tx.wait();
 // Parse MarketDeployed event from receipt to get clone address
@@ -450,7 +475,7 @@ const receipt = await tx.wait();
 
 ```typescript
 const iface = new utils.Interface([
-  "event MarketDeployed(address indexed market, bytes32 indexed questionId, uint8 nOutcomes, uint40 tradingDeadline, uint40 resolutionDeadline, bytes32 salt)"
+  "event MarketDeployed(address indexed market, bytes32 indexed questionId, uint8 nOutcomes, uint40 tradingDeadline, uint40 resolutionDeadline)"
 ]);
 const log   = receipt.logs.find(l => l.topics[0] === iface.getEventTopic("MarketDeployed"));
 const event = iface.parseLog(log);
