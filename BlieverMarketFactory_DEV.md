@@ -11,14 +11,16 @@
 ```
 contracts/src/
 ├── BlieverMarketFactory.sol        ← This contract
-├── interfaces/
-│   ├── IBlieverV1Pool.sol          ← pool.registerMarket, pool.deregisterMarket, pool.alpha, pool.maxRiskPerMarket
-│   └── IBlieverUmaAdapter.sol      ← adapter.initializeQuestion
-└── (local, defined inline in BlieverMarketFactory.sol)
-    └── IDeployableMarket           ← initialize, pause, unpause, expireUnresolved, view getters
+├── BlieverMarket.sol               ← Clone implementation (implements IDeployableMarket)
+└── interfaces/
+    ├── IBlieverV1Pool.sol          ← alpha, maxRiskPerMarket, registerMarket, deregisterMarket, claimWinnings, asset
+    ├── IBlieverUmaAdapter.sol      ← adapter.initializeQuestion
+    ├── IBlieverMarket.sol          ← adapter-facing view getters: questionId, resolved, resolutionDeadline, outcomeCount
+    └── IDeployableMarket.sol       ← factory-facing mutators: initialize, pause, unpause, expireUnresolved
+                                       (extends IBlieverMarket — view getters are inherited)
 ```
 
-`IDeployableMarket` is a factory-specific interface defined at the top of `BlieverMarketFactory.sol`. It covers the BlieverMarket functions that **only the factory calls**. It does not duplicate the adapter-facing methods (`resolve`, `questionId`, `outcomeCount`) already in `IBlieverMarket.sol`.
+`IDeployableMarket` is a standalone interface file at `contracts/src/interfaces/IDeployableMarket.sol`. It extends `IBlieverMarket` and covers the `BlieverMarket` entry-points that **only the factory calls**. Because it inherits `IBlieverMarket`, the view getters (`questionId`, `resolved`, `resolutionDeadline`) are available on any `IDeployableMarket` reference without being redeclared. `BlieverMarket` declares `IDeployableMarket` in its own inheritance chain, providing a compile-time guarantee that it implements the full factory surface.
 
 ---
 
@@ -76,10 +78,15 @@ _grantRole(PAUSER_ROLE,        admin);
 
 ## 4. `IDeployableMarket` — Interface Specification
 
-Defined inline at the top of `BlieverMarketFactory.sol`. All methods are `onlyFactory` guarded in `BlieverMarket`.
+Defined in `contracts/src/interfaces/IDeployableMarket.sol`. The interface extends `IBlieverMarket`, inheriting the adapter-facing view getters so they are accessible on any `IDeployableMarket` typed reference without duplication.
 
 ```solidity
-interface IDeployableMarket {
+import {IBlieverMarket} from "./IBlieverMarket.sol";
+
+/// @dev Minimal interface for the factory-specific calls into BlieverMarket clones.
+interface IDeployableMarket is IBlieverMarket {
+
+    /// @dev Called once, immediately after clone deployment.
     function initialize(
         address _pool,
         bytes32 _questionId,
@@ -92,15 +99,32 @@ interface IDeployableMarket {
         address _factory
     ) external;
 
+    /// @dev Halts buy / sell / claim on the clone. Callable only by `factory`.
     function pause()   external;
-    function unpause() external;
-    function expireUnresolved() external;
 
-    function resolutionDeadline() external view returns (uint40);
-    function resolved()           external view returns (bool);
-    function questionId()         external view returns (bytes32);
+    /// @dev Resumes trading on the clone. Callable only by `factory`.
+    function unpause() external;
+
+    /// @dev Forces a zero-payout settlement once resolutionDeadline has passed.
+    ///      Callable only by `factory`.
+    function expireUnresolved() external;
 }
 ```
+
+The view getters `resolutionDeadline() returns (uint40)`, `resolved() returns (bool)`, and `questionId() returns (bytes32)` are **not redeclared** in `IDeployableMarket` — they are inherited from `IBlieverMarket`. Any `IDeployableMarket` typed reference exposes them without an extra interface declaration.
+
+`BlieverMarket` lists `IDeployableMarket` in its inheritance chain:
+
+```solidity
+contract BlieverMarket is
+    Initializable,
+    ReentrancyGuardTransient,
+    PausableUpgradeable,
+    IDeployableMarket
+{ ... }
+```
+
+This provides a compile-time guarantee that `BlieverMarket` implements every function required by both `IDeployableMarket` and `IBlieverMarket`. Any future change to either interface that breaks `BlieverMarket` is caught by the compiler immediately.
 
 **Parameter order in `initialize` matches `BlieverMarket.sol` exactly** — any mismatch produces a silent ABI misdecode (wrong storage slots written). If `BlieverMarket.initialize` ever changes parameter order, this interface must be updated atomically.
 
