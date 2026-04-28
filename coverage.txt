@@ -1,0 +1,8 @@
+   --> test/BlieverMarketFactory/BlieverMarketFactory_DeployMarket.t.sol:255:5:
+Ran 19 tests for test/BlieverMarketFactory/BlieverMarketFactory_Constructor.t.sol:BlieverMarketFactory_Constructor
+Ran 30 tests for test/BlieverMarketFactory/BlieverMarketFactory_Lifecycle.t.sol:BlieverMarketFactory_Lifecycle
+Ran 21 tests for test/BlieverMarketFactory/BlieverMarketFactory_Views.t.sol:BlieverMarketFactory_Views
+Ran 38 tests for test/BlieverMarketFactory/BlieverMarketFactory_DeployMarket.t.sol:BlieverMarketFactory_DeployMarket
+| File                                                     | % Lines           | % Statements      | % Branches     | % Funcs         |
+| src/BlieverMarketFactory.sol                             | 97.85% (91/93)    | 97.25% (106/109)  | 95.65% (22/23) | 100.00% (13/13) |
+
