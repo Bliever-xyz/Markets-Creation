@@ -85,9 +85,3 @@ Each of the four constructor parameters is independently tested to confirm `Blie
 - Epsilon / address prediction math (covered in `BlieverMarketFactory_Views.t.sol`)
 
 ---
-
-## Improvement / Debugging Notes
-
-- To test a new constructor parameter, add a zero-address variant and a valid-value check.
-- If `AccessControl` role selectors change (e.g., upgrading OZ version), update `test_constants_OPERATOR_ROLE_selector` and `test_constants_PAUSER_ROLE_selector` first.
-- `test_constructor_acceptsAnyContractAsImpl` will fail if a stricter code-pattern check is ever added to the constructor — this is intentional as a regression canary.
