@@ -6,25 +6,6 @@
 
 ---
 
-## File Map
-
-```
-contracts/test/BlieverMarketFactory/
-├── BlieverMarketFactoryBase.t.sol        ← Mocks + shared setUp (abstract, not collected)
-├── BlieverMarketFactory_Constructor.t.sol
-├── BlieverMarketFactory_DeployMarket.t.sol
-├── BlieverMarketFactory_Lifecycle.t.sol
-└── BlieverMarketFactory_Views.t.sol
-
-docs (each file has a companion):
-├── BlieverMarketFactory_Constructor.md
-├── BlieverMarketFactory_DeployMarket.md
-├── BlieverMarketFactory_Lifecycle.md
-└── BlieverMarketFactory_Views.md
-```
-
----
-
 ## What Is Tested
 
 | File | Function(s) tested | Test count |
