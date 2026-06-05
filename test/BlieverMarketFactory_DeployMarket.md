@@ -157,9 +157,3 @@ Tests the ERC-20 pull and approval path when `params.reward > 0`:
 - computeEpsilon math precision (→ Views tests)
 
 ---
-
-## Improvement / Debugging Notes
-
-- If `_computeEpsilon` returns 0 (e.g., pool returns maxRisk=0), deployMarket reverts with `ZeroEpsilon`. Add a test for this by calling `mockPool.setMaxRisk(0)` before deploy.
-- Reward token tests use `MockRewardToken` (18-dec OZ ERC-20). Tests for 6-dec reward tokens (e.g., USDC as reward) may expose decimal-precision edge cases worth testing separately.
-- The `test_deployMarket_reverts_whenPaused` test confirms `whenNotPaused` but not `nonReentrant`. Reentrancy on deployMarket would require a malicious pool or adapter mock — add if threat model requires it.
