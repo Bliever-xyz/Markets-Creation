@@ -129,10 +129,3 @@ Each test uses `_freshMarket(label)` — a helper that deploys a 2-outcome binar
 - Real oracle resolution (UMA adapter is mocked — only initializeQuestion is spied on)
 
 ---
-
-## Improvement / Debugging Notes
-
-- `test_expireUnresolved_reverts_alreadyResolved` resolves via `mockAdapter` prank. If the resolver address ever changes (e.g., a new adapter deployment), update `_resolveMarket` in `FactoryTestBase`.
-- The lifecycle tests do not test reentrancy on `expireUnresolved`. Add a malicious pool mock that re-enters the factory if reentrancy protection needs explicit validation.
-- `test_deregisterMarket_reverts_notAdmin` validates operator role cannot deregister. If a future version adds an `OPERATOR_DEREGISTER_ROLE`, this test becomes a regression guard — update it intentionally.
-- Factory-level `pause` and clone-level `pauseMarket` are independent mechanisms. A test that pauses both and verifies the interaction (e.g., unpauseMarket works while factory is paused) could be added under the "combined state" scenario.
