@@ -126,10 +126,3 @@ Uses `vm.assume(qId1 != qId2)`. Confirms the CREATE2 salt derivation `keccak256(
 - `predictMarketAddress` for a factory deployed at a different address (address is factory-specific by CREATE2 design)
 
 ---
-
-## Improvement / Debugging Notes
-
-- If `_lnLookup` values are ever updated (e.g., for higher precision), update `_manualLn` in this test file to match and re-run the exact-value tests. The fuzz tests will catch formula drift automatically.
-- `test_computeEpsilon_doublingMaxRisk_doublesEpsilon` uses `assertApproxEqAbs(..., 1)` to allow for one wei of integer rounding. If the formula ever changes to include a non-linear R term, this test will fail — which is the intended behavior.
-- The 45-byte EIP-1167 proxy length check in `test_predictMarketAddress_hasBytecodeAfterDeployment` is a constant defined by the EIP itself. If OpenZeppelin ever changes the clone bytecode format, this test will catch it.
-- Alpha and maxRisk sensitivity tests (`test_computeEpsilon_doublingMaxRisk_doublesEpsilon`, `test_computeEpsilon_higherAlpha_yieldsLowerEpsilon`) reset pool state after each test via `setUp()`. They do not restore pool state mid-test — safe because each test function gets a fresh `setUp()`.
